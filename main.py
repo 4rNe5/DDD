@@ -46,27 +46,44 @@ class Outline3DWidget(QGLWidget):
     def extract_outlines(self):
         img = self.original_image.copy()
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
 
-        # 노이즈 제거를 위한 가우시안 블러 적용
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        # 1. 노이즈 제거를 위한 적절한 블러링 (약한 블러)
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
 
-        # 경계선 감지를 위한 이진화
-        ret, thresh = cv2.threshold(blurred, self.threshold_value, 255, cv2.THRESH_BINARY_INV)
+        # 2. 언샤프 마스킹 -> 선명도
+        sharpened = cv2.addWeighted(gray, 1.8, blurred, -0.8, 0)
 
-        # 컨투어 찾기 (계층 구조 포함)
+        # 3. 적응형 임계값 처리 - 로컬 영역별 최적 임계값
+        adaptive_thresh = cv2.adaptiveThreshold(
+            sharpened, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 11, 2)
+
+        # 4. 일반 임계값과 적응형 임계값 결합
+        _, normal_thresh = cv2.threshold(sharpened, self.threshold_value, 255, cv2.THRESH_BINARY_INV)
+        combined_thresh = cv2.bitwise_or(normal_thresh, adaptive_thresh)
+
+        # 5. 모폴로지 연산 (미세 노이즈 제거)
+        kernel = np.ones((2, 2), np.uint8)
+        cleaned = cv2.morphologyEx(combined_thresh, cv2.MORPH_OPEN, kernel)
+
+        # 6. 컨투어 추출 방식 -> 엣지 디테일 개선
         contour_mode = cv2.RETR_TREE if self.show_inner_contours else cv2.RETR_EXTERNAL
-        contours, hierarchy = cv2.findContours(thresh, contour_mode, cv2.CHAIN_APPROX_SIMPLE)
+        contours, hierarchy = cv2.findContours(cleaned, contour_mode, cv2.CHAIN_APPROX_TC89_KCOS)
 
-        # 작은 컨투어 필터링 (노이즈 제거)
-        min_contour_area = 100  # 최소 영역 크기
+        # 7. 너무 작은 컨투어 필터링
+        min_contour_area = 10  # 임계 DOWN
         filtered_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > min_contour_area]
 
         self.outlines = []
-        h, w = gray.shape
         for cnt in filtered_contours:
-            # 컨투어 단순화 (더 부드러운 라인)
-            epsilon = 0.0025 * cv2.arcLength(cnt, True)
+            # 8. 컨투어 단순화 (epsilon 값 작게, 정밀도 개선용)
+            epsilon = 0.0015 * cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, epsilon, True)
+
+            # 너무 단순한 형태 필터링 (선택적)
+            if len(approx) < 3:
+                continue
 
             points = []
             for pt in approx:
@@ -74,6 +91,22 @@ class Outline3DWidget(QGLWidget):
                 # 중심 정렬 및 y축 뒤집기(화면 좌표계와 OpenGL 좌표계 맞춤)
                 points.append([x - w / 2, -(y - h / 2), 0])
             self.outlines.append(points)
+
+        # 9. 디테일이 충분하지 않으면 캐니 엣지로 보완
+        if len(self.outlines) < 10:  # 적은 수의 컨투어만 감지된 경우
+            edges = cv2.Canny(sharpened, 30, 100)
+            edges_contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_KCOS)
+
+            for cnt in edges_contours:
+                if cv2.contourArea(cnt) > 5:  # 매우 작은 것만 제외
+                    epsilon = 0.001 * cv2.arcLength(cnt, True)  # 더 정밀하게
+                    approx = cv2.approxPolyDP(cnt, epsilon, True)
+
+                    points = []
+                    for pt in approx:
+                        x, y = pt[0]
+                        points.append([x - w / 2, -(y - h / 2), 0])
+                    self.outlines.append(points)
 
         self.has_image = True
         self.update()
@@ -94,16 +127,40 @@ class Outline3DWidget(QGLWidget):
         glShadeModel(GL_SMOOTH)
         glLineWidth(2.0)
 
+        # 클리핑 범위 확장
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        glFrustum(-1.0, 1.0, -1.0, 1.0, 5.0, 3000.0)
+        glMatrixMode(GL_MODELVIEW)
+
+        # 조명 설정
+        glEnable(GL_COLOR_MATERIAL)
+        glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+
+        # 깊이 테스트 품질 향상
+        glEnable(GL_DEPTH_TEST)
+        glDepthFunc(GL_LEQUAL)
+
+        # 안티앨리어싱 설정
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+        # 각도에 따른 컬링 비활성화 (모든 각도에서 렌더링)
+        glDisable(GL_CULL_FACE)
+
     def resizeGL(self, width, height):
         glViewport(0, 0, width, height)
         glMatrixMode(GL_PROJECTION)
         glLoadIdentity()
-        gluPerspective(45, width / height if height else 1, 1, 1000)
+        # 시야각과 클리핑 평면 거리 조정
+        gluPerspective(45, width / height if height else 1, 1, 3000)
         glMatrixMode(GL_MODELVIEW)
 
     def paintGL(self):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glLoadIdentity()
+
+        # 카메라 위치 조정으로 시점 개선
         glTranslatef(0, 0, self.translate_z)
         glRotatef(self.rotation_x, 1, 0, 0)
         glRotatef(self.rotation_y, 0, 1, 0)
@@ -111,6 +168,14 @@ class Outline3DWidget(QGLWidget):
 
         if not self.has_image:
             return
+
+        # 깊이 테스트 활성화로 겹침 처리 개선
+        glEnable(GL_DEPTH_TEST)
+        # 앤티앨리어싱 활성화로 선 부드럽게
+        glEnable(GL_LINE_SMOOTH)
+        glEnable(GL_POLYGON_SMOOTH)
+        glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
+        glHint(GL_POLYGON_SMOOTH_HINT, GL_NICEST)
 
         # 외곽선 색상 설정
         color = self.line_color.getRgbF()
@@ -124,6 +189,10 @@ class Outline3DWidget(QGLWidget):
                 self.draw_wireframe(outline)
             else:
                 self.draw_solid(outline)
+
+        # 렌더링 설정 복원
+        glDisable(GL_LINE_SMOOTH)
+        glDisable(GL_POLYGON_SMOOTH)
 
     def draw_wireframe(self, outline):
         # 앞면 그리기
@@ -146,22 +215,55 @@ class Outline3DWidget(QGLWidget):
         glEnd()
 
     def draw_solid(self, outline):
+        # 솔리드 렌더링 시 조명 활성화
+        glEnable(GL_LIGHTING)
+        glEnable(GL_LIGHT0)
+
+        # 빛 위치 설정
+        light_position = [0.0, 200.0, 500.0, 1.0]
+        glLightfv(GL_LIGHT0, GL_POSITION, light_position)
+
+        # 빛 특성 설정
+        ambient = [0.3, 0.3, 0.3, 1.0]
+        diffuse = [0.8, 0.8, 0.8, 1.0]
+        specular = [1.0, 1.0, 1.0, 1.0]
+
+        glLightfv(GL_LIGHT0, GL_AMBIENT, ambient)
+        glLightfv(GL_LIGHT0, GL_DIFFUSE, diffuse)
+        glLightfv(GL_LIGHT0, GL_SPECULAR, specular)
+
+        # 색상 설정
+        color = self.line_color.getRgbF()
+        glColor3f(color[0], color[1], color[2])
+
         # 앞면
         glBegin(GL_POLYGON)
+        glNormal3f(0.0, 0.0, 1.0)  # 앞면 법선 벡터
         for pt in outline:
             glVertex3f(pt[0], pt[1], 0)
         glEnd()
 
         # 뒷면
         glBegin(GL_POLYGON)
+        glNormal3f(0.0, 0.0, -1.0)  # 뒷면 법선 벡터
         for pt in reversed(outline):
             glVertex3f(pt[0], pt[1], -self.extrusion_depth)
         glEnd()
 
-        # 옆면
+        # 옆면 (쿼드 스트립으로 더 효율적으로)
         glBegin(GL_QUAD_STRIP)
         for i in range(len(outline)):
             pt = outline[i]
+            next_pt = outline[(i + 1) % len(outline)]
+
+            # 옆면 법선 벡터 계산 (외적 사용)
+            dx = next_pt[0] - pt[0]
+            dy = next_pt[1] - pt[1]
+            length = (dx * dx + dy * dy) ** 0.5
+            if length > 0:
+                nx, ny = dy / length, -dx / length
+                glNormal3f(nx, ny, 0.0)
+
             glVertex3f(pt[0], pt[1], 0)
             glVertex3f(pt[0], pt[1], -self.extrusion_depth)
 
@@ -170,6 +272,10 @@ class Outline3DWidget(QGLWidget):
         glVertex3f(pt[0], pt[1], 0)
         glVertex3f(pt[0], pt[1], -self.extrusion_depth)
         glEnd()
+
+        # 조명 비활성화 (와이어프레임 모드 위해)
+        glDisable(GL_LIGHT0)
+        glDisable(GL_LIGHTING)
 
     def set_extrusion_depth(self, depth):
         self.extrusion_depth = depth
@@ -204,24 +310,22 @@ class Outline3DWidget(QGLWidget):
     def wheelEvent(self, event):
         delta = event.angleDelta().y()
         # 줌 속도를 현재 스케일에 비례하게 조정
-        zoom_factor = 1.1
+        zoom_speed = 0.05 * max(0.1, self.scale)
 
         # 줌인
         if delta > 0:
-            self.scale *= zoom_factor
+            self.scale += zoom_speed
             # 최대 줌 제한
-            if self.scale > 20.0:
-                self.scale = 20.0
+            if self.scale > 50.0:
+                self.scale = 50.0
         # 줌아웃
         else:
-            self.scale /= zoom_factor
+            self.scale -= zoom_speed
             # 최소 줌 제한
-            if self.scale < 0.1:
-                self.scale = 0.1
+            if self.scale < 0.05:
+                self.scale = 0.05
 
-        # 줌 변경 시 깊이 조정 (더 직관적인 줌 효과)
-        self.translate_z = -300 * (1.0 / self.scale)
-
+        # 화면 갱신
         self.update()
 
 
@@ -238,9 +342,9 @@ class ImagePreviewWidget(QWidget):
     def paintEvent(self, event):
         if self.image:
             painter = QPainter(self)
-            # 이미지 크기를 위젯에 맞게 조절
+            # 이미지 크기 조절 (Fit to widget)
             scaled_img = self.image.scaled(self.size(), Qt.KeepAspectRatio)
-            # 중앙에 정렬
+            # 중앙정렬
             x = (self.width() - scaled_img.width()) // 2
             y = (self.height() - scaled_img.height()) // 2
             painter.drawPixmap(x, y, scaled_img)
@@ -249,7 +353,7 @@ class ImagePreviewWidget(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('일러스트 외곽선 3D 시각화')
+        self.setWindowTitle('DDD')
         self.setGeometry(100, 100, 1200, 800)
 
         central_widget = QWidget()
@@ -268,8 +372,8 @@ class MainWindow(QMainWindow):
         color_btn.clicked.connect(self.change_color)
         top_controls.addWidget(color_btn)
 
-        # 와이어프레임/솔리드 전환 버튼
-        self.render_btn = QPushButton('와이어프레임/솔리드 전환')
+        # 와이어프레임 / 솔리드 전환 버튼
+        self.render_btn = QPushButton('와이어프레임 / 솔리드 전환')
         self.render_btn.clicked.connect(self.toggle_render_mode)
         top_controls.addWidget(self.render_btn)
 
@@ -278,10 +382,11 @@ class MainWindow(QMainWindow):
         reset_btn.clicked.connect(self.reset_view)
         top_controls.addWidget(reset_btn)
 
-        # 내보내기 버튼 추가
+        # 내보내기 버튼
         export_btn = QPushButton('3D 모델 내보내기')
         export_btn.clicked.connect(self.export_model)
         top_controls.addWidget(export_btn)
+
 
         main_layout.addLayout(top_controls)
 
@@ -292,7 +397,7 @@ class MainWindow(QMainWindow):
         self.outline_widget = Outline3DWidget()
         content_layout.addWidget(self.outline_widget, 3)  # 비율 3
 
-        # 사이드바 컨트롤과 미리보기
+        # 사이드바 컨트롤 & 미리보기
         sidebar_layout = QVBoxLayout()
 
         # 컨트롤 그룹
@@ -300,7 +405,7 @@ class MainWindow(QMainWindow):
         controls_layout = QVBoxLayout()
 
         # 돌출 깊이 컨트롤
-        depth_label = QLabel("돌출 깊이:")
+        depth_label = QLabel("돌출 깊이 :")
         controls_layout.addWidget(depth_label)
 
         self.depth_slider = QSlider(Qt.Horizontal)
@@ -315,7 +420,7 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.depth_value)
 
         # 경계값 컨트롤 (이미지 외곽선 감지 임계값)
-        threshold_label = QLabel("외곽선 감지 임계값:")
+        threshold_label = QLabel("외곽선 감지 임계값 :")
         controls_layout.addWidget(threshold_label)
 
         self.threshold_slider = QSlider(Qt.Horizontal)
@@ -339,7 +444,7 @@ class MainWindow(QMainWindow):
         controls_group.setLayout(controls_layout)
         sidebar_layout.addWidget(controls_group)
 
-        # 이미지 미리보기
+        # 미리보기
         preview_group = QGroupBox("원본 이미지")
         preview_layout = QVBoxLayout()
         self.preview_widget = QLabel()
@@ -370,19 +475,19 @@ class MainWindow(QMainWindow):
         )
 
         if file_path:
-            # 로딩 중 메시지 표시
+            # 로딩 중 메시지
             self.statusBar().showMessage("이미지 처리 중...")
             QApplication.processEvents()
 
             success = self.outline_widget.load_image_and_extract_outline(file_path)
 
             if success:
-                # 파일 이름 표시
+                # 파일 이름
                 import os
                 filename = os.path.basename(file_path)
                 self.statusBar().showMessage(f"로드됨: {filename}")
 
-                # 미리보기 이미지 표시
+                # 미리보기 이미지
                 pixmap = QPixmap(file_path)
                 self.preview_widget.setPixmap(pixmap.scaled(
                     self.preview_widget.width(),
@@ -466,7 +571,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "내보내기 오류", f"3D 모델 내보내기 실패: {str(e)}")
 
     def export_to_stl(self, filepath):
-        """STL 파일로 내보내기 (ASCII 포맷)"""
+        """STL 파일 Export """
         with open(filepath, 'w') as f:
             f.write("solid extruded_image\n")
 
@@ -474,15 +579,15 @@ class MainWindow(QMainWindow):
                 if len(outline) < 3:
                     continue
 
-                # 삼각형으로 면 분할
-                # 간단한 fan triangulation (첫번째 점에서 모든 삼각형 형성)
+                # 면 분할
+                # EZ fan triangulation (첫번째 점에서 모든 삼각형 형성)
                 for i in range(1, len(outline) - 1):
                     # 앞면 삼각형
                     p1 = outline[0]
                     p2 = outline[i]
                     p3 = outline[i + 1]
 
-                    # 앞면 법선 벡터는 +z 방향
+                    # 앞면 법선 벡터 -> +z 방향
                     f.write(f"facet normal 0.0 0.0 1.0\n")
                     f.write("  outer loop\n")
                     f.write(f"    vertex {p1[0]:.6f} {p1[1]:.6f} {0.0:.6f}\n")
@@ -561,7 +666,7 @@ class MainWindow(QMainWindow):
                     f.write(f"v {pt[0]:.6f} {pt[1]:.6f} {depth:.6f}\n")
                     vertex_count += 1
 
-                # 앞면 (삼각형 팬 형태로 분할)
+                # 앞면 (삼각형 팬 형태 분할)
                 f.write("f")
                 for i in range(front_start_idx, back_start_idx):
                     f.write(f" {i}")
@@ -573,7 +678,7 @@ class MainWindow(QMainWindow):
                     f.write(f" {i}")
                 f.write("\n")
 
-                # 옆면 (사각형으로)
+                # 옆면 (사각형)
                 for i in range(len(outline)):
                     idx1 = front_start_idx + i
                     idx2 = front_start_idx + (i + 1) % len(outline)
@@ -589,4 +694,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

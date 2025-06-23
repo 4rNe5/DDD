@@ -1,5 +1,4 @@
-opencv-python
-matplotlib
-scikit-learn
-scipy
-pillow
+opencv-python~=4.11.0.86
+numpy~=2.0.2
+PyQt5~=5.15.11
+PyOpenGL~=3.1.7
